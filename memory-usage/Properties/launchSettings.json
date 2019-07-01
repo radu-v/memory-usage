@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "memory-usage": {
+      "commandName": "Project",
+      "commandLineArgs": "chrome"
+    }
+  }
+}

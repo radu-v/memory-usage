@@ -1,35 +1,44 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Runtime.InteropServices;
-
-namespace memory_usage
+﻿namespace memory_usage
 {
-   class Program
+   using System;
+   using System.Collections.Generic;
+   using System.Linq;
+   using System.Runtime.InteropServices;
+   using System.Text.RegularExpressions;
+
+   static class Program
    {
       static void Main(string[] args)
       {
          try
          {
-            var processes = GetProcesses().ToList();
-            var rootProcesses = processes.Where(pe => pe.ParentId == 0);
-            var processesExceptRootProcesses = processes.Where(pe => pe.ParentId != 0).ToList();
-            var usageSummary = rootProcesses
-               .Select(parentProcessEntry => new ProcessEntry
+            AdjustPrivileges();
+
+            var processTree = GetProcesses()
+               .ToProcessTree();
+
+            processTree
+               .ForEach((p, i) =>
                {
-                  Id = parentProcessEntry.Id,
-                  ExeFile = parentProcessEntry.ExeFile,
-                  WorkingSet = parentProcessEntry.WorkingSet + AggregateChildrenWorkingSet(processesExceptRootProcesses, parentProcessEntry)
-               })
-               .OrderByDescending(p => p.WorkingSet)
-               .ToDictionary(p => p.Id);
+                  Console.WriteLine($"{new string(' ', i)}{p.Id}::{p.ImageName} - {ToMegabytes(p.WorkingSet)} MB");
+               });
 
 
-            foreach (var (id, processEntry) in usageSummary)
+            if (args.Length > 0)
             {
-               Console.WriteLine($"{id}::{processEntry.ExeFile} - {ToMegabytes(processEntry.WorkingSet)} MB");
-            }
+               Console.WriteLine();
+               var procname = args[0];
 
+               var process = processTree.FindProcessByName(Regex.Escape(procname));
+
+               if (process == null)
+               {
+                  Console.WriteLine($"Process {procname} not found.");
+                  return;
+               }
+               var processUsage = process.TotalWorkingSet();
+               Console.WriteLine($"Process {process.ImageName} uses {ToMegabytes(processUsage)} MB");
+            }
          }
          catch (Exception e)
          {
@@ -38,65 +47,92 @@ namespace memory_usage
          }
       }
 
-      static ulong AggregateChildrenWorkingSet(IList<ProcessEntry> processesExceptRootProcesses, ProcessEntry parentProcessEntry) =>
-         processesExceptRootProcesses
-            .Where(c => c.ParentId == parentProcessEntry.Id)
-            .Aggregate(0UL, (current, childProcess) => current + childProcess.WorkingSet + AggregateChildrenWorkingSet(processesExceptRootProcesses, childProcess));
-
-      static ulong ToMegabytes(ulong bytes) => bytes / 1048576;
-
-      [DllImport("kernel32.dll", SetLastError = true)]
-      static extern IntPtr CreateToolhelp32Snapshot(SnapshotFlags dwFlags, uint th32ProcessId);
-
-      [DllImport("kernel32", SetLastError = true, CharSet = CharSet.Auto)]
-      static extern bool Process32First([In]IntPtr hSnapshot, ref PROCESSENTRY32 lppe);
-
-      [DllImport("kernel32", SetLastError = true, CharSet = CharSet.Auto)]
-      static extern bool Process32Next([In]IntPtr hSnapshot, ref PROCESSENTRY32 lppe);
-
-      [DllImport("kernel32.dll", SetLastError = true)]
-      public static extern IntPtr OpenProcess(ProcessAccessFlags processAccess, bool bInheritHandle, uint processId);
-
-      [DllImport("psapi.dll", SetLastError = true)]
-      static extern bool GetProcessMemoryInfo(IntPtr hProcess, out PROCESS_MEMORY_COUNTERS counters, uint size);
-
-      [DllImport("kernel32", SetLastError = true)]
-      [return: MarshalAs(UnmanagedType.Bool)]
-      static extern bool CloseHandle([In] IntPtr hObject);
-
-      public static bool HasParentProcess(uint pid)
+      static void AdjustPrivileges()
       {
-         var hProcess = OpenProcess(ProcessAccessFlags.QueryInformation, false, pid);
-         if (hProcess == IntPtr.Zero) return false;
+         var luid = new Win32ApiHelpers.LUID();
+         if (!Win32ApiImports.LookupPrivilegeValue(null, "SeDebugPrivilege", ref luid))
+         {
+            return;
+         }
 
-         CloseHandle(hProcess);
-         return true;
+         var tokenHandle = IntPtr.Zero;
+         try
+         {
+            if (!Win32ApiImports.OpenProcessToken(Win32ApiImports.GetCurrentProcess(), Win32ApiHelpers.TOKEN_ADJUST_PRIVILEGES, out tokenHandle))
+            {
+               return;
+            }
+
+            var tp = new Win32ApiHelpers.TOKEN_PRIVILEGES
+            {
+               PrivilegeCount = 1,
+               Privileges = new Win32ApiHelpers.LUID_AND_ATTRIBUTES[1]
+            };
+
+            tp.Privileges[0].Luid = luid;
+            tp.Privileges[0].Attributes = Win32ApiHelpers.SE_PRIVILEGE_ENABLED;
+
+            Win32ApiImports.AdjustTokenPrivileges(tokenHandle, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero);
+         }
+         finally
+         {
+            if (tokenHandle != IntPtr.Zero)
+            {
+               Win32ApiImports.CloseHandle(tokenHandle);
+            }
+         }
       }
 
-      public static IEnumerable<ProcessEntry> GetProcesses()
+      static ProcessEntry ToProcessTree(this IEnumerable<ProcessEntry32> processes)
+      {
+         if (processes == null) throw new ArgumentNullException(nameof(processes));
+
+         var processList = processes.ToList();
+
+         var processEntryList = processList
+            .OrderBy(p => p.th32ParentProcessID)
+            .ThenBy(p => p.th32ProcessID)
+            .Select(p => new ProcessEntry
+            {
+               Id = p.th32ProcessID,
+               ParentId = p.th32ParentProcessID,
+               ImageName = p.szExeFile,
+               WorkingSet = GetWorkingSet(p.th32ProcessID),
+               ValidParent = processList.IsProcessRunning(p.th32ParentProcessID)
+            }).ToList();
+
+         return new ProcessEntry()
+            .BuildTree(processEntryList);
+      }
+
+      static ulong GetWorkingSet(uint processId)
+      {
+         var hProcess = Win32ApiImports.OpenProcess(ProcessAccessFlags.QueryLimitedInformation, false, processId);
+
+         if (!Win32ApiImports.GetProcessMemoryInfo(hProcess, out var counters, (uint)Marshal.SizeOf(typeof(ProcessMemoryCounters))))
+            return 0;
+
+         Win32ApiImports.CloseHandle(hProcess);
+
+         return counters.WorkingSetSize;
+      }
+
+      static ulong ToMegabytes(ulong? bytes) => bytes / 1048576 ?? 0;
+
+      public static bool IsProcessRunning(this IEnumerable<ProcessEntry32> processes, uint pid) => processes.Any(p => p.th32ProcessID == pid);
+
+      public static IEnumerable<ProcessEntry32> GetProcesses()
       {
          var handleToSnapshot = IntPtr.Zero;
          try
          {
-            var procEntry = new PROCESSENTRY32 { dwSize = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32)) };
-            handleToSnapshot = CreateToolhelp32Snapshot(SnapshotFlags.Process, 0);
-            if (Process32First(handleToSnapshot, ref procEntry))
+            var procEntry = new ProcessEntry32 { dwSize = (uint)Marshal.SizeOf(typeof(ProcessEntry32)) };
+            handleToSnapshot = Win32ApiImports.CreateToolhelp32Snapshot(SnapshotFlags.Process, 0);
+
+            if (Win32ApiImports.Process32First(handleToSnapshot, ref procEntry))
             {
-               do
-               {
-                  var hProcess = OpenProcess(ProcessAccessFlags.QueryInformation, false, procEntry.th32ProcessID);
-
-                  if (!GetProcessMemoryInfo(hProcess, out var counters, (uint)Marshal.SizeOf(typeof(PROCESS_MEMORY_COUNTERS)))) continue;
-                  CloseHandle(hProcess);
-
-                  yield return new ProcessEntry
-                  {
-                     Id = procEntry.th32ProcessID,
-                     ParentId = HasParentProcess(procEntry.th32ParentProcessID) ? procEntry.th32ParentProcessID : 0,
-                     ExeFile = procEntry.szExeFile,
-                     WorkingSet = counters.WorkingSetSize
-                  };
-               } while (Process32Next(handleToSnapshot, ref procEntry));
+               do yield return procEntry;
+               while (Win32ApiImports.Process32Next(handleToSnapshot, ref procEntry));
             }
             else
             {
@@ -105,63 +141,8 @@ namespace memory_usage
          }
          finally
          {
-            CloseHandle(handleToSnapshot);
+            Win32ApiImports.CloseHandle(handleToSnapshot);
          }
-      }
-
-      [Flags]
-      public enum SnapshotFlags : uint
-      {
-         HeapList = 0x00000001,
-         Process = 0x00000002,
-         Thread = 0x00000004,
-         Module = 0x00000008
-      }
-
-      [Flags]
-      public enum ProcessAccessFlags : uint
-      {
-         QueryInformation = 0x00000400
-      }
-
-      [StructLayout(LayoutKind.Sequential, Size = 72)]
-      struct PROCESS_MEMORY_COUNTERS
-      {
-         public uint cb;
-         public uint PageFaultCount;
-         public ulong PeakWorkingSetSize;
-         public ulong WorkingSetSize;
-         public ulong QuotaPeakPagedPoolUsage;
-         public ulong QuotaPagedPoolUsage;
-         public ulong QuotaPeakNonPagedPoolUsage;
-         public ulong QuotaNonPagedPoolUsage;
-         public ulong PagefileUsage;
-         public ulong PeakPagefileUsage;
-      }
-
-      [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
-      public struct PROCESSENTRY32
-      {
-         const int MAX_PATH = 260;
-         internal uint dwSize;
-         internal uint cntUsage;
-         internal uint th32ProcessID;
-         internal IntPtr th32DefaultHeapID;
-         internal uint th32ModuleID;
-         internal uint cntThreads;
-         internal uint th32ParentProcessID;
-         internal int pcPriClassBase;
-         internal uint dwFlags;
-         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = MAX_PATH)]
-         internal string szExeFile;
-      }
-
-      public class ProcessEntry
-      {
-         public uint Id { get; set; }
-         public uint ParentId { get; set; }
-         public string ExeFile { get; set; }
-         public ulong WorkingSet { get; set; }
       }
    }
 }
